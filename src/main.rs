@@ -20,10 +20,15 @@ mod monitor;
 mod printer;
 mod timescale;
 mod url_generator;
+mod profile;
 
 #[cfg(unix)]
 #[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use client::{ClientError, RequestResult};
 
@@ -211,6 +216,8 @@ impl FromStr for ConnectToEntry {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut opts: Opts = Opts::parse();
+
+    let _server = profile::start_server().await;
 
     let http_version: http::Version = match (opts.http2, opts.http_version) {
         (true, Some(_)) => anyhow::bail!("--http2 and --http-version are exclusive"),

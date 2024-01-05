@@ -1,0 +1,38 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+	"name": "Rust",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/rust:1-1-bullseye",
+	// "runArgs": ["--network", "host"]
+
+	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+	// "mounts": [
+	// 	{
+	// 		"source": "devcontainer-cargo-cache-${devcontainerId}",
+	// 		"target": "/usr/local/cargo",
+	// 		"type": "volume"
+	// 	}
+	// ]
+
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {
+		"ghcr.io/devcontainers/features/go:1": {}
+	},
+
+	// Use 'forwardPorts' to make a list of ports inside the container available locally.
+	// "forwardPorts": [],
+	"portsAttributes": {"3000": {"onAutoForward": "ignore"}, "3001": {"onAutoForward": "ignore"}},
+	"otherPortsAttributes": { "onAutoForward" : "ignore" },
+	"forwardPorts": [8080],
+	// "appPort": [8080],
+	// https://stackoverflow.com/questions/73741583/why-automatic-port-forwarding-how-to-prevent-vs-code-from-doing-it
+	// Use 'postCreateCommand' to run commands after the container is created.
+	"postCreateCommand": "sudo apt-get update && sudo apt-get install -y graphviz && go install github.com/google/pprof@latest"
+
+	// Configure tool-specific properties.
+	// "customizations": {},
+
+	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+	// "remoteUser": "root"
+}
