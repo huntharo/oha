@@ -67,10 +67,12 @@ url = "2.4.0"
 pin-project-lite = "0.2.13"
 http-body-util = "0.1.0"
 hyper-util = { version = "0.1.1", features = ["tokio"] }
+axum = "0.7.3"
 
-[target.'cfg(unix)'.dependencies]
+# [target.'cfg(unix)'.dependencies]
 rlimit = "0.10.0"
-jemallocator = "0.5.0"
+tikv-jemallocator = { version = "0.5.4", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+jemalloc_pprof = "0.1.0"
 
 [dev-dependencies]
 assert_cmd = "2.0.2"
