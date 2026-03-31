@@ -2196,23 +2196,1009 @@ pub async fn work_until_with_qps_latency_correction(
 
 /// Optimized workers for `--no-tui` mode
 pub mod fast {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering},
+        },
+        thread::JoinHandle,
+        time::{Duration, Instant},
     };
 
     use rand::SeedableRng;
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
+        FastThreadMode,
         client::{
             ClientError, ClientStateHttp1, ClientStateHttp2, HttpWorkType, is_cancel_error,
             is_hyper_error, set_connection_time, setup_http2,
         },
+        cpu_util,
         pcg64si::Pcg64Si,
         result_data::ResultData,
     };
 
     use super::Client;
+
+    const CONTROL_TICK: Duration = Duration::from_secs(1);
+    const SCALE_UP_UTILIZATION: u32 = 50;
+    const SCALE_DOWN_UTILIZATION: u32 = 10;
+    const SCALE_UP_TICKS: u8 = 2;
+    const SCALE_DOWN_TICKS: u8 = 3;
+
+    struct WorkerControl {
+        drain: AtomicBool,
+        shed_connections: AtomicUsize,
+        active_connections: AtomicUsize,
+        utilization: AtomicU32,
+    }
+
+    impl WorkerControl {
+        fn new() -> Self {
+            Self {
+                drain: AtomicBool::new(false),
+                shed_connections: AtomicUsize::new(0),
+                active_connections: AtomicUsize::new(0),
+                utilization: AtomicU32::new(100),
+            }
+        }
+
+        fn utilization(&self) -> u32 {
+            self.utilization.load(Ordering::Relaxed)
+        }
+    }
+
+    struct WorkerHandle {
+        control: Arc<WorkerControl>,
+        join: Option<JoinHandle<()>>,
+        connection_count: usize,
+        draining: bool,
+        idle_ticks: u8,
+    }
+
+    impl WorkerHandle {
+        fn with_control(
+            control: Arc<WorkerControl>,
+            connection_count: usize,
+            join: JoinHandle<()>,
+        ) -> Self {
+            Self {
+                control,
+                join: Some(join),
+                connection_count,
+                draining: false,
+                idle_ticks: 0,
+            }
+        }
+
+        fn is_finished(&self) -> bool {
+            self.join.as_ref().is_some_and(JoinHandle::is_finished)
+        }
+
+        fn join_if_finished(&mut self) -> bool {
+            if self.is_finished() {
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+                return true;
+            }
+
+            false
+        }
+    }
+
+    struct CpuMonitor {
+        last_cpu: Option<Duration>,
+        last_wall: Instant,
+    }
+
+    impl CpuMonitor {
+        fn new() -> Self {
+            Self {
+                last_cpu: cpu_util::thread_cpu_time(),
+                last_wall: Instant::now(),
+            }
+        }
+
+        fn sample(&mut self, control: &WorkerControl) {
+            let now = Instant::now();
+            let Some(cpu_now) = cpu_util::thread_cpu_time() else {
+                control.utilization.store(100, Ordering::Relaxed);
+                self.last_wall = now;
+                return;
+            };
+
+            let Some(last_cpu) = self.last_cpu else {
+                self.last_cpu = Some(cpu_now);
+                self.last_wall = now;
+                return;
+            };
+
+            let wall_delta = now.saturating_duration_since(self.last_wall);
+            let cpu_delta = cpu_now.saturating_sub(last_cpu);
+
+            if wall_delta.is_zero() {
+                return;
+            }
+
+            let utilization = ((cpu_delta.as_secs_f64() / wall_delta.as_secs_f64()) * 100.0)
+                .clamp(0.0, 100.0)
+                .round() as u32;
+            control.utilization.store(utilization, Ordering::Relaxed);
+            self.last_cpu = Some(cpu_now);
+            self.last_wall = now;
+        }
+    }
+
+    fn start_cpu_monitor(
+        local: &tokio::task::LocalSet,
+        control: Arc<WorkerControl>,
+        token: CancellationToken,
+        worker_done: CancellationToken,
+    ) {
+        local.spawn_local(async move {
+            let mut interval = tokio::time::interval(CONTROL_TICK);
+            let mut monitor = CpuMonitor::new();
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = worker_done.cancelled() => break,
+                    _ = interval.tick() => monitor.sample(&control),
+                }
+            }
+        });
+    }
+
+    fn distribute_connections(n_connections: usize, n_threads: usize) -> Vec<usize> {
+        (0..n_threads)
+            .filter_map(|i| {
+                let num_connection =
+                    n_connections / n_threads + usize::from((n_connections % n_threads) > i);
+                (num_connection > 0).then_some(num_connection)
+            })
+            .collect()
+    }
+
+    fn register_connection(control: &WorkerControl) {
+        control.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_connection(control: &WorkerControl, worker_done: &CancellationToken) {
+        if control.active_connections.fetch_sub(1, Ordering::Relaxed) == 1 {
+            worker_done.cancel();
+        }
+    }
+
+    fn should_retire_connection(control: &WorkerControl, retire_flag: &AtomicBool) -> bool {
+        if retire_flag.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        if control.drain.load(Ordering::Relaxed) {
+            retire_flag.store(true, Ordering::Relaxed);
+            return true;
+        }
+
+        let mut requested = control.shed_connections.load(Ordering::Relaxed);
+        while requested > 0 {
+            match control.shed_connections.compare_exchange_weak(
+                requested,
+                requested - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    retire_flag.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                Err(next) => requested = next,
+            }
+        }
+
+        false
+    }
+
+    fn reap_finished_workers(workers: &mut Vec<WorkerHandle>) {
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].join_if_finished() {
+                workers.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn spawn_worker_for_h1_fixed(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        counter: Arc<AtomicIsize>,
+        token: CancellationToken,
+        num_connections: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            for _ in 0..num_connections {
+                let report_tx = report_tx.clone();
+                let counter = counter.clone();
+                let client = client.clone();
+                let token = token.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let mut result_data = ResultData::default();
+
+                    let work = async {
+                        let mut client_state = ClientStateHttp1::default();
+                        while counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                            let res = client.work_http1(&mut client_state).await;
+                            let is_cancel = is_cancel_error(&res);
+                            result_data.push(res);
+                            if is_cancel {
+                                break;
+                            }
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = work => {}
+                    }
+
+                    report_tx.send(result_data).unwrap();
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h2_fixed(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        counter: Arc<AtomicIsize>,
+        token: CancellationToken,
+        num_connections: usize,
+        n_http_parallel: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            for _ in 0..num_connections {
+                let report_tx = report_tx.clone();
+                let counter = counter.clone();
+                let client = client.clone();
+                let token = token.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let mut has_err = false;
+                    let mut result_data_err = ResultData::default();
+                    let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
+
+                    loop {
+                        let client = client.clone();
+                        match setup_http2(&client, &mut rng).await {
+                            Ok((connection_time, send_request)) => {
+                                let futures = (0..n_http_parallel)
+                                    .map(|_| {
+                                        let mut client_state = ClientStateHttp2 {
+                                            rng: SeedableRng::from_rng(&mut rand::rng()),
+                                            send_request: send_request.clone(),
+                                        };
+                                        let counter = counter.clone();
+                                        let client = client.clone();
+                                        let report_tx = report_tx.clone();
+                                        let token = token.clone();
+
+                                        tokio::task::spawn_local(async move {
+                                            let mut result_data = ResultData::default();
+
+                                            let work = async {
+                                                while counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                                                    let mut res =
+                                                        client.work_http2(&mut client_state).await;
+                                                    let is_cancel = is_cancel_error(&res);
+                                                    let is_reconnect = is_hyper_error(&res);
+                                                    set_connection_time(&mut res, connection_time);
+                                                    result_data.push(res);
+
+                                                    if is_cancel || is_reconnect {
+                                                        return is_cancel;
+                                                    }
+                                                }
+
+                                                true
+                                            };
+
+                                            let is_cancel = tokio::select! {
+                                                is_cancel = work => is_cancel,
+                                                _ = token.cancelled() => true,
+                                            };
+
+                                            report_tx.send(result_data).unwrap();
+                                            is_cancel
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                let mut connection_gone = false;
+                                for future in futures {
+                                    match future.await {
+                                        Ok(true) | Err(_) => connection_gone = true,
+                                        _ => {}
+                                    }
+                                }
+
+                                if connection_gone {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                                    has_err = true;
+                                    result_data_err.push(Err(err));
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if has_err {
+                        report_tx.send(result_data_err).unwrap();
+                    }
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h1_until_fixed(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        is_end: Arc<AtomicBool>,
+        token: CancellationToken,
+        num_connections: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            for _ in 0..num_connections {
+                let report_tx = report_tx.clone();
+                let is_end = is_end.clone();
+                let client = client.clone();
+                let token = token.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let mut result_data = ResultData::default();
+
+                    let work = async {
+                        let mut client_state = ClientStateHttp1::default();
+                        loop {
+                            let res = client.work_http1(&mut client_state).await;
+                            let is_cancel = is_cancel_error(&res);
+                            result_data.push(res);
+                            if is_cancel || is_end.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = work => {}
+                        _ = token.cancelled() => {
+                            result_data.push(Err(ClientError::Deadline));
+                        }
+                    }
+
+                    report_tx.send(result_data).unwrap();
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h2_until_fixed(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        is_end: Arc<AtomicBool>,
+        token: CancellationToken,
+        num_connections: usize,
+        n_http_parallel: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            for _ in 0..num_connections {
+                let report_tx = report_tx.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let is_end = is_end.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let mut has_err = false;
+                    let mut result_data_err = ResultData::default();
+                    let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
+
+                    loop {
+                        let client = client.clone();
+                        match setup_http2(&client, &mut rng).await {
+                            Ok((connection_time, send_request)) => {
+                                let futures = (0..n_http_parallel)
+                                    .map(|_| {
+                                        let mut client_state = ClientStateHttp2 {
+                                            rng: SeedableRng::from_rng(&mut rand::rng()),
+                                            send_request: send_request.clone(),
+                                        };
+                                        let client = client.clone();
+                                        let report_tx = report_tx.clone();
+                                        let token = token.clone();
+                                        let is_end = is_end.clone();
+
+                                        tokio::task::spawn_local(async move {
+                                            let mut result_data = ResultData::default();
+
+                                            let work = async {
+                                                loop {
+                                                    let mut res =
+                                                        client.work_http2(&mut client_state).await;
+                                                    let is_cancel = is_cancel_error(&res)
+                                                        || is_end.load(Ordering::Relaxed);
+                                                    let is_reconnect = is_hyper_error(&res);
+                                                    set_connection_time(&mut res, connection_time);
+
+                                                    result_data.push(res);
+                                                    if is_cancel || is_reconnect {
+                                                        return is_cancel;
+                                                    }
+                                                }
+                                            };
+
+                                            let is_cancel = tokio::select! {
+                                                is_cancel = work => is_cancel,
+                                                _ = token.cancelled() => {
+                                                    result_data.push(Err(ClientError::Deadline));
+                                                    true
+                                                }
+                                            };
+
+                                            report_tx.send(result_data).unwrap();
+                                            is_cancel
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                let mut connection_gone = false;
+                                for future in futures {
+                                    match future.await {
+                                        Ok(true) | Err(_) => connection_gone = true,
+                                        _ => {}
+                                    }
+                                }
+
+                                if connection_gone {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                has_err = true;
+                                result_data_err.push(Err(err));
+                                if is_end.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if has_err {
+                        report_tx.send(result_data_err).unwrap();
+                    }
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h1_adaptive(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        counter: Arc<AtomicIsize>,
+        token: CancellationToken,
+        control: Arc<WorkerControl>,
+        num_connections: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let worker_done = CancellationToken::new();
+
+            start_cpu_monitor(&local, control.clone(), token.clone(), worker_done.clone());
+
+            for _ in 0..num_connections {
+                register_connection(&control);
+                let report_tx = report_tx.clone();
+                let counter = counter.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let control = control.clone();
+                let worker_done = worker_done.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let retire_flag = AtomicBool::new(false);
+                    let mut result_data = ResultData::default();
+
+                    let work = async {
+                        let mut client_state = ClientStateHttp1::default();
+                        while counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                            let res = client.work_http1(&mut client_state).await;
+                            let is_cancel = is_cancel_error(&res);
+                            result_data.push(res);
+                            if is_cancel || should_retire_connection(&control, &retire_flag) {
+                                break;
+                            }
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = work => {}
+                    }
+
+                    finish_connection(&control, &worker_done);
+                    report_tx.send(result_data).unwrap();
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h2_adaptive(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        counter: Arc<AtomicIsize>,
+        token: CancellationToken,
+        control: Arc<WorkerControl>,
+        num_connections: usize,
+        n_http_parallel: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let worker_done = CancellationToken::new();
+
+            start_cpu_monitor(&local, control.clone(), token.clone(), worker_done.clone());
+
+            for _ in 0..num_connections {
+                register_connection(&control);
+                let report_tx = report_tx.clone();
+                let counter = counter.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let control = control.clone();
+                let worker_done = worker_done.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let retire_flag = Arc::new(AtomicBool::new(false));
+                    let mut has_err = false;
+                    let mut result_data_err = ResultData::default();
+                    let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
+
+                    loop {
+                        if retire_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let client = client.clone();
+                        match setup_http2(&client, &mut rng).await {
+                            Ok((connection_time, send_request)) => {
+                                let futures = (0..n_http_parallel)
+                                    .map(|_| {
+                                        let mut client_state = ClientStateHttp2 {
+                                            rng: SeedableRng::from_rng(&mut rand::rng()),
+                                            send_request: send_request.clone(),
+                                        };
+                                        let counter = counter.clone();
+                                        let client = client.clone();
+                                        let report_tx = report_tx.clone();
+                                        let token = token.clone();
+                                        let control = control.clone();
+                                        let retire_flag = retire_flag.clone();
+
+                                        tokio::task::spawn_local(async move {
+                                            let mut result_data = ResultData::default();
+
+                                            let work = async {
+                                                while counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                                                    let mut res =
+                                                        client.work_http2(&mut client_state).await;
+                                                    let is_cancel = is_cancel_error(&res);
+                                                    let is_reconnect = is_hyper_error(&res);
+                                                    set_connection_time(&mut res, connection_time);
+                                                    result_data.push(res);
+
+                                                    if is_cancel
+                                                        || is_reconnect
+                                                        || should_retire_connection(
+                                                            &control,
+                                                            retire_flag.as_ref(),
+                                                        )
+                                                    {
+                                                        return true;
+                                                    }
+                                                }
+
+                                                true
+                                            };
+
+                                            let connection_gone = tokio::select! {
+                                                done = work => done,
+                                                _ = token.cancelled() => true,
+                                            };
+
+                                            report_tx.send(result_data).unwrap();
+                                            connection_gone
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                let mut connection_gone = false;
+                                for future in futures {
+                                    match future.await {
+                                        Ok(true) | Err(_) => connection_gone = true,
+                                        _ => {}
+                                    }
+                                }
+
+                                if connection_gone || retire_flag.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if counter.fetch_sub(1, Ordering::Relaxed) > 0 {
+                                    has_err = true;
+                                    result_data_err.push(Err(err));
+                                    if should_retire_connection(&control, retire_flag.as_ref()) {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    finish_connection(&control, &worker_done);
+                    if has_err {
+                        report_tx.send(result_data_err).unwrap();
+                    }
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h1_until_adaptive(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        is_end: Arc<AtomicBool>,
+        token: CancellationToken,
+        control: Arc<WorkerControl>,
+        num_connections: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let worker_done = CancellationToken::new();
+
+            start_cpu_monitor(&local, control.clone(), token.clone(), worker_done.clone());
+
+            for _ in 0..num_connections {
+                register_connection(&control);
+                let report_tx = report_tx.clone();
+                let is_end = is_end.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let control = control.clone();
+                let worker_done = worker_done.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let retire_flag = AtomicBool::new(false);
+                    let mut result_data = ResultData::default();
+
+                    let work = async {
+                        let mut client_state = ClientStateHttp1::default();
+                        loop {
+                            let res = client.work_http1(&mut client_state).await;
+                            let is_cancel = is_cancel_error(&res);
+                            result_data.push(res);
+                            if is_cancel
+                                || is_end.load(Ordering::Relaxed)
+                                || should_retire_connection(&control, &retire_flag)
+                            {
+                                break;
+                            }
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = work => {}
+                        _ = token.cancelled() => {
+                            result_data.push(Err(ClientError::Deadline));
+                        }
+                    }
+
+                    finish_connection(&control, &worker_done);
+                    report_tx.send(result_data).unwrap();
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn spawn_worker_for_h2_until_adaptive(
+        client: Arc<Client>,
+        report_tx: kanal::Sender<ResultData>,
+        is_end: Arc<AtomicBool>,
+        token: CancellationToken,
+        control: Arc<WorkerControl>,
+        num_connections: usize,
+        n_http_parallel: usize,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let local = tokio::task::LocalSet::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let worker_done = CancellationToken::new();
+
+            start_cpu_monitor(&local, control.clone(), token.clone(), worker_done.clone());
+
+            for _ in 0..num_connections {
+                register_connection(&control);
+                let report_tx = report_tx.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let is_end = is_end.clone();
+                let control = control.clone();
+                let worker_done = worker_done.clone();
+
+                local.spawn_local(Box::pin(async move {
+                    let retire_flag = Arc::new(AtomicBool::new(false));
+                    let mut has_err = false;
+                    let mut result_data_err = ResultData::default();
+                    let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
+
+                    loop {
+                        if retire_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let client = client.clone();
+                        match setup_http2(&client, &mut rng).await {
+                            Ok((connection_time, send_request)) => {
+                                let futures = (0..n_http_parallel)
+                                    .map(|_| {
+                                        let mut client_state = ClientStateHttp2 {
+                                            rng: SeedableRng::from_rng(&mut rand::rng()),
+                                            send_request: send_request.clone(),
+                                        };
+                                        let client = client.clone();
+                                        let report_tx = report_tx.clone();
+                                        let token = token.clone();
+                                        let is_end = is_end.clone();
+                                        let control = control.clone();
+                                        let retire_flag = retire_flag.clone();
+
+                                        tokio::task::spawn_local(async move {
+                                            let mut result_data = ResultData::default();
+
+                                            let work = async {
+                                                loop {
+                                                    let mut res =
+                                                        client.work_http2(&mut client_state).await;
+                                                    let is_cancel = is_cancel_error(&res)
+                                                        || is_end.load(Ordering::Relaxed)
+                                                        || should_retire_connection(
+                                                            &control,
+                                                            retire_flag.as_ref(),
+                                                        );
+                                                    let is_reconnect = is_hyper_error(&res);
+                                                    set_connection_time(&mut res, connection_time);
+                                                    result_data.push(res);
+
+                                                    if is_cancel || is_reconnect {
+                                                        return true;
+                                                    }
+                                                }
+                                            };
+
+                                            let connection_gone = tokio::select! {
+                                                done = work => done,
+                                                _ = token.cancelled() => {
+                                                    result_data.push(Err(ClientError::Deadline));
+                                                    true
+                                                }
+                                            };
+
+                                            report_tx.send(result_data).unwrap();
+                                            connection_gone
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                let mut connection_gone = false;
+                                for future in futures {
+                                    match future.await {
+                                        Ok(true) | Err(_) => connection_gone = true,
+                                        _ => {}
+                                    }
+                                }
+
+                                if connection_gone || retire_flag.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                has_err = true;
+                                result_data_err.push(Err(err));
+                                if is_end.load(Ordering::Relaxed)
+                                    || should_retire_connection(&control, retire_flag.as_ref())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    finish_connection(&control, &worker_done);
+                    if has_err {
+                        report_tx.send(result_data_err).unwrap();
+                    }
+                }));
+            }
+
+            rt.block_on(local);
+        })
+    }
+
+    fn run_adaptive_coordinator<F, S>(
+        total_connections: usize,
+        max_threads: usize,
+        mut spawn_worker: F,
+        should_stop_scaling: S,
+    ) where
+        F: FnMut(Arc<WorkerControl>, usize) -> JoinHandle<()>,
+        S: Fn() -> bool,
+    {
+        let mut workers = Vec::new();
+        let initial_control = Arc::new(WorkerControl::new());
+        let initial_join = spawn_worker(initial_control.clone(), total_connections);
+        workers.push(WorkerHandle::with_control(
+            initial_control,
+            total_connections,
+            initial_join,
+        ));
+        let mut all_busy_ticks = 0u8;
+
+        loop {
+            reap_finished_workers(&mut workers);
+            if workers.is_empty() {
+                break;
+            }
+
+            let active_indices = workers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, worker)| (!worker.draining).then_some(index))
+                .collect::<Vec<_>>();
+
+            if !should_stop_scaling() && active_indices.len() < max_threads {
+                let all_busy = !active_indices.is_empty()
+                    && active_indices
+                        .iter()
+                        .all(|index| workers[*index].control.utilization() >= SCALE_UP_UTILIZATION);
+                if all_busy {
+                    all_busy_ticks += 1;
+                } else {
+                    all_busy_ticks = 0;
+                }
+
+                if all_busy_ticks >= SCALE_UP_TICKS {
+                    let total_active_connections: usize = active_indices
+                        .iter()
+                        .map(|index| workers[*index].connection_count)
+                        .sum();
+                    if let Some((busiest_index, busiest_worker)) = active_indices
+                        .iter()
+                        .map(|index| (*index, workers[*index].connection_count))
+                        .max_by_key(|(_, count)| *count)
+                    {
+                        let target_new_connections =
+                            (total_active_connections / (active_indices.len() + 1)).max(1);
+                        let moved_connections =
+                            target_new_connections.min(busiest_worker.saturating_sub(1));
+                        if moved_connections > 0 {
+                            workers[busiest_index]
+                                .control
+                                .shed_connections
+                                .fetch_add(moved_connections, Ordering::Relaxed);
+                            workers[busiest_index].connection_count -= moved_connections;
+
+                            let control = Arc::new(WorkerControl::new());
+                            let join = spawn_worker(control.clone(), moved_connections);
+                            workers.push(WorkerHandle::with_control(
+                                control,
+                                moved_connections,
+                                join,
+                            ));
+                        }
+                    }
+
+                    all_busy_ticks = 0;
+                }
+            } else {
+                all_busy_ticks = 0;
+            }
+
+            if !should_stop_scaling() && active_indices.len() > 1 {
+                let mut retire_candidate = None;
+                for index in active_indices {
+                    let worker = &mut workers[index];
+                    if worker.control.utilization() <= SCALE_DOWN_UTILIZATION {
+                        worker.idle_ticks += 1;
+                        if worker.idle_ticks >= SCALE_DOWN_TICKS {
+                            retire_candidate = Some(index);
+                            break;
+                        }
+                    } else {
+                        worker.idle_ticks = 0;
+                    }
+                }
+
+                if let Some(index) = retire_candidate {
+                    workers[index].draining = true;
+                    workers[index].control.drain.store(true, Ordering::Relaxed);
+                }
+            }
+
+            std::thread::sleep(CONTROL_TICK);
+        }
+    }
 
     /// Run n tasks by m workers
     pub async fn work(
@@ -2221,6 +3207,7 @@ pub mod fast {
         n_tasks: usize,
         n_connections: usize,
         n_http_parallel: usize,
+        thread_mode: FastThreadMode,
     ) {
         #[cfg(feature = "http3")]
         if matches!(client.work_type(), HttpWorkType::H3) {
@@ -2236,207 +3223,113 @@ pub mod fast {
         }
 
         let counter = Arc::new(AtomicIsize::new(n_tasks as isize));
-        let num_threads = num_cpus::get_physical();
-        let connections = (0..num_threads).filter_map(|i| {
-            let num_connection = n_connections / num_threads
-                + (if (n_connections % num_threads) > i {
-                    1
-                } else {
-                    0
-                });
-            if num_connection > 0 {
-                Some(num_connection)
-            } else {
-                None
-            }
-        });
-        let token = tokio_util::sync::CancellationToken::new();
-
-        let handles = match client.work_type() {
-            #[cfg(feature = "http3")]
-            HttpWorkType::H3 => unreachable!(),
-            HttpWorkType::H2 => {
-                connections
-                    .map(|num_connections| {
-                        let report_tx = report_tx.clone();
-                        let counter = counter.clone();
-                        let client = client.clone();
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        let token = token.clone();
-
-                        std::thread::spawn(move || {
-                            let client = client.clone();
-                            let local = tokio::task::LocalSet::new();
-                            for _ in 0..num_connections {
-                                let report_tx = report_tx.clone();
-                                let counter = counter.clone();
-                                let client = client.clone();
-                                let token = token.clone();
-                                local.spawn_local(Box::pin(async move {
-                                    let mut has_err = false;
-                                    let mut result_data_err = ResultData::default();
-                                    let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
-                                    loop {
-                                        let client = client.clone();
-                                        match setup_http2(&client, &mut rng).await {
-                                            Ok((connection_time, send_request)) => {
-                                                let futures = (0..n_http_parallel)
-                                                    .map(|_| {
-                                                        let mut client_state = ClientStateHttp2 {
-                                                            rng: SeedableRng::from_rng(
-                                                                &mut rand::rng(),
-                                                            ),
-                                                            send_request: send_request.clone(),
-                                                        };
-                                                        let counter = counter.clone();
-                                                        let client = client.clone();
-                                                        let report_tx = report_tx.clone();
-                                                        let token = token.clone();
-                                                        tokio::task::spawn_local(async move {
-                                                            let mut result_data =
-                                                                ResultData::default();
-
-                                                            let work = async {
-                                                                while counter
-                                                                    .fetch_sub(1, Ordering::Relaxed)
-                                                                    > 0
-                                                                {
-                                                                    let mut res = client
-                                                                        .work_http2(
-                                                                            &mut client_state,
-                                                                        )
-                                                                        .await;
-                                                                    let is_cancel =
-                                                                        is_cancel_error(&res);
-                                                                    let is_reconnect =
-                                                                        is_hyper_error(&res);
-                                                                    set_connection_time(
-                                                                        &mut res,
-                                                                        connection_time,
-                                                                    );
-
-                                                                    result_data.push(res);
-
-                                                                    if is_cancel || is_reconnect {
-                                                                        return is_cancel;
-                                                                    }
-                                                                }
-                                                                true
-                                                            };
-
-                                                            let is_cancel = tokio::select! {
-                                                                is_cancel = work => {
-                                                                    is_cancel
-                                                                }
-                                                                _ = token.cancelled() => {
-                                                                    true
-                                                                }
-                                                            };
-
-                                                            report_tx.send(result_data).unwrap();
-                                                            is_cancel
-                                                        })
-                                                    })
-                                                    .collect::<Vec<_>>();
-
-                                                let mut connection_gone = false;
-                                                for f in futures {
-                                                    match f.await {
-                                                        Ok(true) => {
-                                                            // All works done
-                                                            connection_gone = true;
-                                                        }
-                                                        Err(_) => {
-                                                            // Unexpected
-                                                            connection_gone = true;
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-
-                                                if connection_gone {
-                                                    break;
-                                                }
-                                            }
-                                            Err(err) => {
-                                                if counter.fetch_sub(1, Ordering::Relaxed) > 0 {
-                                                    has_err = true;
-                                                    result_data_err.push(Err(err));
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if has_err {
-                                        report_tx.send(result_data_err).unwrap();
-                                    }
-                                }));
-                            }
-
-                            rt.block_on(local);
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            }
-            HttpWorkType::H1 => connections
-                .map(|num_connection| {
-                    let report_tx = report_tx.clone();
-                    let counter = counter.clone();
-                    let client = client.clone();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-
-                    let token = token.clone();
-                    std::thread::spawn(move || {
-                        let local = tokio::task::LocalSet::new();
-
-                        for _ in 0..num_connection {
-                            let report_tx = report_tx.clone();
-                            let counter = counter.clone();
-                            let client = client.clone();
-                            let token = token.clone();
-                            local.spawn_local(Box::pin(async move {
-                                let mut result_data = ResultData::default();
-
-                                tokio::select! {
-                                    _ = token.cancelled() => {}
-                                    _ = async {
-                                        let mut client_state = ClientStateHttp1::default();
-                                        while counter.fetch_sub(1, Ordering::Relaxed) > 0 {
-                                            let res = client.work_http1(&mut client_state).await;
-                                            let is_cancel = is_cancel_error(&res);
-                                            result_data.push(res);
-                                            if is_cancel {
-                                                break;
-                                            }
-                                        }
-                                    } => {}
-                                }
-                                report_tx.send(result_data).unwrap();
-                            }));
-                        }
-                        rt.block_on(local);
-                    })
-                })
-                .collect::<Vec<_>>(),
-        };
+        let token = CancellationToken::new();
+        let ctrlc_token = token.clone();
 
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.unwrap();
-            token.cancel();
+            ctrlc_token.cancel();
         });
 
-        tokio::task::block_in_place(|| {
-            for handle in handles {
-                let _ = handle.join();
+        match thread_mode {
+            FastThreadMode::Fixed(num_threads) => {
+                let connections = distribute_connections(n_connections, num_threads);
+                let handles = match client.work_type() {
+                    #[cfg(feature = "http3")]
+                    HttpWorkType::H3 => unreachable!(),
+                    HttpWorkType::H1 => connections
+                        .into_iter()
+                        .map(|num_connection| {
+                            spawn_worker_for_h1_fixed(
+                                client.clone(),
+                                report_tx.clone(),
+                                counter.clone(),
+                                token.clone(),
+                                num_connection,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    HttpWorkType::H2 => connections
+                        .into_iter()
+                        .map(|num_connection| {
+                            spawn_worker_for_h2_fixed(
+                                client.clone(),
+                                report_tx.clone(),
+                                counter.clone(),
+                                token.clone(),
+                                num_connection,
+                                n_http_parallel,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                };
+
+                tokio::task::block_in_place(|| {
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                });
             }
-        });
+            FastThreadMode::Adaptive { max_threads } => {
+                let coordinator = match client.work_type() {
+                    #[cfg(feature = "http3")]
+                    HttpWorkType::H3 => unreachable!(),
+                    HttpWorkType::H1 => {
+                        let client = client.clone();
+                        let report_tx = report_tx.clone();
+                        let counter_for_spawn = counter.clone();
+                        let counter_for_stop = counter.clone();
+                        let token = token.clone();
+                        std::thread::spawn(move || {
+                            run_adaptive_coordinator(
+                                n_connections,
+                                max_threads,
+                                move |control, num_connections| {
+                                    spawn_worker_for_h1_adaptive(
+                                        client.clone(),
+                                        report_tx.clone(),
+                                        counter_for_spawn.clone(),
+                                        token.clone(),
+                                        control,
+                                        num_connections,
+                                    )
+                                },
+                                move || counter_for_stop.load(Ordering::Relaxed) <= 0,
+                            );
+                        })
+                    }
+                    HttpWorkType::H2 => {
+                        let client = client.clone();
+                        let report_tx = report_tx.clone();
+                        let counter_for_spawn = counter.clone();
+                        let counter_for_stop = counter.clone();
+                        let token = token.clone();
+                        std::thread::spawn(move || {
+                            run_adaptive_coordinator(
+                                n_connections,
+                                max_threads,
+                                move |control, num_connections| {
+                                    spawn_worker_for_h2_adaptive(
+                                        client.clone(),
+                                        report_tx.clone(),
+                                        counter_for_spawn.clone(),
+                                        token.clone(),
+                                        control,
+                                        num_connections,
+                                        n_http_parallel,
+                                    )
+                                },
+                                move || counter_for_stop.load(Ordering::Relaxed) <= 0,
+                            );
+                        })
+                    }
+                };
+
+                tokio::task::block_in_place(|| {
+                    let _ = coordinator.join();
+                });
+            }
+        }
     }
 
     /// Run until dead_line by n workers
@@ -2447,6 +3340,7 @@ pub mod fast {
         n_connections: usize,
         n_http_parallel: usize,
         wait_ongoing_requests_after_deadline: bool,
+        thread_mode: FastThreadMode,
     ) {
         #[cfg(feature = "http3")]
         if matches!(client.work_type(), HttpWorkType::H3) {
@@ -2462,191 +3356,102 @@ pub mod fast {
             return;
         }
 
-        let num_threads = num_cpus::get_physical();
-
         let is_end = Arc::new(AtomicBool::new(false));
-        let connections = (0..num_threads).filter_map(|i| {
-            let num_connection = n_connections / num_threads
-                + (if (n_connections % num_threads) > i {
-                    1
-                } else {
-                    0
-                });
-            if num_connection > 0 {
-                Some(num_connection)
-            } else {
-                None
+        let token = CancellationToken::new();
+        let coordinator = match thread_mode {
+            FastThreadMode::Fixed(num_threads) => {
+                let connections = distribute_connections(n_connections, num_threads);
+                let handles = match client.work_type() {
+                    #[cfg(feature = "http3")]
+                    HttpWorkType::H3 => unreachable!(),
+                    HttpWorkType::H1 => connections
+                        .into_iter()
+                        .map(|num_connection| {
+                            spawn_worker_for_h1_until_fixed(
+                                client.clone(),
+                                report_tx.clone(),
+                                is_end.clone(),
+                                token.clone(),
+                                num_connection,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    HttpWorkType::H2 => connections
+                        .into_iter()
+                        .map(|num_connection| {
+                            spawn_worker_for_h2_until_fixed(
+                                client.clone(),
+                                report_tx.clone(),
+                                is_end.clone(),
+                                token.clone(),
+                                num_connection,
+                                n_http_parallel,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                };
+
+                Some(std::thread::spawn(move || {
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                }))
             }
-        });
-        let token = tokio_util::sync::CancellationToken::new();
-        let handles = match client.work_type() {
-            #[cfg(feature = "http3")]
-            HttpWorkType::H3 => unreachable!(),
-            HttpWorkType::H2 => {
-                connections
-                .map(|num_connections| {
-                    let report_tx = report_tx.clone();
+            FastThreadMode::Adaptive { max_threads } => Some(match client.work_type() {
+                #[cfg(feature = "http3")]
+                HttpWorkType::H3 => unreachable!(),
+                HttpWorkType::H1 => {
                     let client = client.clone();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    let token = token.clone();
-                    let is_end = is_end.clone();
-
-                    std::thread::spawn(move || {
-                        let client = client.clone();
-                        let local = tokio::task::LocalSet::new();
-                        for _ in 0..num_connections {
-                            let report_tx = report_tx.clone();
-                            let client = client.clone();
-                            let token = token.clone();
-                            let is_end = is_end.clone();
-                            local.spawn_local(Box::pin(async move {
-                                let mut has_err = false;
-                                let mut result_data_err = ResultData::default();
-                                let mut rng: Pcg64Si = SeedableRng::from_rng(&mut rand::rng());
-                                loop {
-                                    let client = client.clone();
-                                    match setup_http2(&client, &mut rng).await {
-                                        Ok((connection_time, send_request)) => {
-                                            let futures = (0..n_http_parallel)
-                                                .map(|_| {
-                                                    let mut client_state = ClientStateHttp2 {
-                                                        rng: SeedableRng::from_rng(&mut rand::rng()),
-                                                        send_request: send_request.clone(),
-                                                    };
-                                                    let client = client.clone();
-                                                    let report_tx = report_tx.clone();
-                                                    let token = token.clone();
-                                                    let is_end = is_end.clone();
-                                                    tokio::task::spawn_local(async move {
-                                                        let mut result_data = ResultData::default();
-
-                                                        let work = async {
-                                                            loop {
-                                                                let mut res = client
-                                                                    .work_http2(&mut client_state)
-                                                                    .await;
-                                                                let is_cancel = is_cancel_error(&res) || is_end.load(Ordering::Relaxed);
-                                                                let is_reconnect = is_hyper_error(&res);
-                                                                set_connection_time(
-                                                                    &mut res,
-                                                                    connection_time,
-                                                                );
-
-                                                                result_data.push(res);
-
-                                                                if is_cancel || is_reconnect {
-                                                                    return is_cancel;
-                                                                }
-                                                            }
-                                                        };
-
-                                                        let is_cancel = tokio::select! {
-                                                            is_cancel = work => {
-                                                                is_cancel
-                                                            }
-                                                            _ = token.cancelled() => {
-                                                                result_data.push(Err(ClientError::Deadline));
-                                                                true
-                                                            }
-                                                        };
-
-                                                        report_tx.send(result_data).unwrap();
-                                                        is_cancel
-                                                    })
-                                                })
-                                                .collect::<Vec<_>>();
-
-                                            let mut connection_gone = false;
-                                            for f in futures {
-                                                match f.await {
-                                                    Ok(true) => {
-                                                        // All works done
-                                                        connection_gone = true;
-                                                    }
-                                                    Err(_) => {
-                                                        // Unexpected
-                                                        connection_gone = true;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-
-                                            if connection_gone {
-                                                break;
-                                            }
-                                        }
-                                        Err(err) => {
-                                            has_err = true;
-                                            result_data_err.push(Err(err));
-                                            if is_end.load(Ordering::Relaxed) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if has_err {
-                                    report_tx.send(result_data_err).unwrap();
-                                }
-                            }));
-                        }
-
-                        rt.block_on(local);
-                    })
-                })
-                .collect::<Vec<_>>()
-            }
-            HttpWorkType::H1 => connections
-                .map(|num_connection| {
                     let report_tx = report_tx.clone();
-                    let is_end = is_end.clone();
-                    let client = client.clone();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-
+                    let is_end_for_spawn = is_end.clone();
+                    let is_end_for_stop = is_end.clone();
                     let token = token.clone();
                     std::thread::spawn(move || {
-                        let local = tokio::task::LocalSet::new();
-
-                        for _ in 0..num_connection {
-                            let report_tx = report_tx.clone();
-                            let is_end = is_end.clone();
-                            let client = client.clone();
-                            let token = token.clone();
-                            local.spawn_local(Box::pin(async move {
-                                let mut result_data = ResultData::default();
-
-                                let work = async {
-                                    let mut client_state = ClientStateHttp1::default();
-                                    loop {
-                                        let res = client.work_http1(&mut client_state).await;
-                                        let is_cancel = is_cancel_error(&res);
-                                        result_data.push(res);
-                                        if is_cancel || is_end.load(Ordering::Relaxed) {
-                                            break;
-                                        }
-                                    }
-                                };
-
-                                tokio::select! {
-                                    _ = work => {
-                                    }
-                                    _ = token.cancelled() => {
-                                        result_data.push(Err(ClientError::Deadline));
-                                    }
-                                }
-                                report_tx.send(result_data).unwrap();
-                            }));
-                        }
-                        rt.block_on(local);
+                        run_adaptive_coordinator(
+                            n_connections,
+                            max_threads,
+                            move |control, num_connections| {
+                                spawn_worker_for_h1_until_adaptive(
+                                    client.clone(),
+                                    report_tx.clone(),
+                                    is_end_for_spawn.clone(),
+                                    token.clone(),
+                                    control,
+                                    num_connections,
+                                )
+                            },
+                            move || is_end_for_stop.load(Ordering::Relaxed),
+                        );
                     })
-                })
-                .collect::<Vec<_>>(),
+                }
+                HttpWorkType::H2 => {
+                    let client = client.clone();
+                    let report_tx = report_tx.clone();
+                    let is_end_for_spawn = is_end.clone();
+                    let is_end_for_stop = is_end.clone();
+                    let token = token.clone();
+                    std::thread::spawn(move || {
+                        run_adaptive_coordinator(
+                            n_connections,
+                            max_threads,
+                            move |control, num_connections| {
+                                spawn_worker_for_h2_until_adaptive(
+                                    client.clone(),
+                                    report_tx.clone(),
+                                    is_end_for_spawn.clone(),
+                                    token.clone(),
+                                    control,
+                                    num_connections,
+                                    n_http_parallel,
+                                )
+                            },
+                            move || is_end_for_stop.load(Ordering::Relaxed),
+                        );
+                    })
+                }
+            }),
         };
+
         tokio::select! {
             _ = tokio::time::sleep_until(dead_line.into()) => {
             }
@@ -2659,9 +3464,10 @@ pub mod fast {
         if !wait_ongoing_requests_after_deadline {
             token.cancel();
         }
+
         tokio::task::block_in_place(|| {
-            for handle in handles {
-                let _ = handle.join();
+            if let Some(coordinator) = coordinator {
+                let _ = coordinator.join();
             }
         });
     }

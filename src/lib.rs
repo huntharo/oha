@@ -30,6 +30,7 @@ mod cli;
 mod client;
 #[cfg(feature = "http3")]
 mod client_h3;
+mod cpu_util;
 mod curl_compat;
 mod db;
 mod histogram;
@@ -155,6 +156,11 @@ Note: If qps is specified, burst will be ignored",
     latency_correction: bool,
     #[arg(help = "No realtime tui", long = "no-tui")]
     no_tui: bool,
+    #[arg(
+        help = "Number of fast-path worker threads to use in --no-tui mode. Defaults to adaptive scaling.",
+        long = "threads"
+    )]
+    threads: Option<usize>,
     #[arg(help = "Frame per second for tui.", default_value = "16", long = "fps")]
     fps: usize,
     #[arg(
@@ -578,6 +584,7 @@ pub async fn run(mut opts: Opts) -> anyhow::Result<()> {
     };
 
     let url = url.into_owned();
+    let requested_fast_threads = opts.threads;
     let client = Arc::new(client::Client {
         request_generator: RequestGenerator {
             url_generator,
@@ -683,6 +690,7 @@ pub async fn run(mut opts: Opts) -> anyhow::Result<()> {
                     n_requests,
                     n_connections,
                     n_http2_parallel,
+                    resolve_fast_thread_mode(requested_fast_threads, n_connections),
                 )
                 .await;
 
@@ -712,6 +720,7 @@ pub async fn run(mut opts: Opts) -> anyhow::Result<()> {
                     n_connections,
                     n_http2_parallel,
                     wait_ongoing_requests_after_deadline,
+                    resolve_fast_thread_mode(requested_fast_threads, n_connections),
                 )
                 .await;
 
@@ -942,6 +951,23 @@ enum WorkMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FastThreadMode {
+    Adaptive { max_threads: usize },
+    Fixed(usize),
+}
+
+fn resolve_fast_thread_mode(threads: Option<usize>, n_connections: usize) -> FastThreadMode {
+    let capped_connections = n_connections.max(1);
+
+    match threads {
+        Some(threads) => FastThreadMode::Fixed(threads.max(1).min(capped_connections)),
+        None => FastThreadMode::Adaptive {
+            max_threads: num_cpus::get_physical().max(1).min(capped_connections),
+        },
+    }
+}
+
 impl Opts {
     fn work_mode(&self) -> WorkMode {
         if self.debug {
@@ -986,5 +1012,70 @@ impl Opts {
                 latency_correction: self.latency_correction,
             }
         }
+    }
+
+    pub fn uses_fast_path(&self) -> bool {
+        let no_tui = self.no_tui || !std::io::stdout().is_tty() || self.debug;
+
+        if !no_tui || self.debug {
+            return false;
+        }
+
+        matches!(
+            self.work_mode(),
+            WorkMode::FixedNumber {
+                query_limit: None,
+                ..
+            } | WorkMode::Until {
+                query_limit: None,
+                ..
+            }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{FastThreadMode, Opts, resolve_fast_thread_mode};
+
+    #[test]
+    fn thread_override_caps_at_connection_count() {
+        let opts = Opts::parse_from(["oha", "--threads", "16", "-c", "4", "http://example.com"]);
+        assert_eq!(
+            resolve_fast_thread_mode(opts.threads, 4),
+            FastThreadMode::Fixed(4)
+        );
+    }
+
+    #[test]
+    fn thread_override_respects_requested_value() {
+        let opts = Opts::parse_from(["oha", "--threads", "2", "-c", "20", "http://example.com"]);
+        assert_eq!(
+            resolve_fast_thread_mode(opts.threads, 20),
+            FastThreadMode::Fixed(2)
+        );
+    }
+
+    #[test]
+    fn default_thread_mode_is_adaptive_and_capped() {
+        let opts = Opts::parse_from(["oha", "-c", "3", "--no-tui", "http://example.com"]);
+        assert_eq!(
+            resolve_fast_thread_mode(opts.threads, 3),
+            FastThreadMode::Adaptive { max_threads: 3 }
+        );
+    }
+
+    #[test]
+    fn no_tui_without_rate_limit_uses_fast_path() {
+        let opts = Opts::parse_from(["oha", "--no-tui", "http://example.com"]);
+        assert!(opts.uses_fast_path());
+    }
+
+    #[test]
+    fn qps_disables_fast_path() {
+        let opts = Opts::parse_from(["oha", "--no-tui", "-q", "10", "http://example.com"]);
+        assert!(!opts.uses_fast_path());
     }
 }
